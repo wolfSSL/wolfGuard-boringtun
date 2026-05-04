@@ -7,10 +7,12 @@ use crate::noise::session::Session;
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 use crate::x25519;
+use aead::{Aead, AeadInPlace, KeyInit, Payload};
 use std::convert::TryInto;
 use std::time::{Duration, SystemTime};
 use wolfssl_wolfcrypt::blake2::{BLAKE2s, BLAKE2sHmac};
-use wolfssl_wolfcrypt::chacha20_poly1305::{ChaCha20Poly1305, XChaCha20Poly1305};
+use wolfssl_wolfcrypt::chacha20_poly1305::ChaCha20Poly1305Aead as ChaCha20Poly1305;
+use wolfssl_wolfcrypt::chacha20_poly1305::XChaCha20Poly1305Aead as XChaCha20Poly1305;
 use wolfssl_wolfcrypt::curve25519::Curve25519Key;
 
 #[cfg(feature = "mock-instant")]
@@ -106,8 +108,19 @@ fn aead_chacha20_seal_inner(
     data: &[u8],
     aad: &[u8],
 ) {
-    let (cipher_out, tag_out) = ciphertext.split_at_mut(data.len());
-    ChaCha20Poly1305::encrypt(key, &nonce, aad, data, cipher_out, tag_out).unwrap();
+    let cipher = ChaCha20Poly1305::new_from_slice(key).unwrap();
+
+    ciphertext[..data.len()].copy_from_slice(data);
+
+    let tag = cipher
+        .encrypt_in_place_detached(
+            aead::Nonce::<ChaCha20Poly1305>::from_slice(&nonce),
+            aad,
+            &mut ciphertext[..data.len()],
+        )
+        .unwrap();
+
+    ciphertext[data.len()..].copy_from_slice(tag.as_ref());
 }
 
 #[inline]
@@ -122,8 +135,33 @@ fn aead_chacha20_open(
     let mut nonce: [u8; 12] = [0; 12];
     nonce[4..].copy_from_slice(&counter.to_le_bytes());
 
-    ChaCha20Poly1305::decrypt(key, &nonce, aad, &data[..data.len()-16], &data[data.len()-16..], buffer)
+    aead_chacha20_open_inner(buffer, key, nonce, data, aad)
         .map_err(|_| WireGuardError::InvalidAeadTag)?;
+    Ok(())
+}
+
+#[inline]
+fn aead_chacha20_open_inner(
+    buffer: &mut [u8],
+    key: &[u8],
+    nonce: [u8; 12],
+    data: &[u8],
+    aad: &[u8],
+) -> Result<(), aead::Error> {
+    let cipher = ChaCha20Poly1305::new_from_slice(key).unwrap();
+
+    let (ciphertext, tag) = data.split_at(data.len() - 16);
+    let mut inner_buffer = ciphertext.to_owned();
+
+    cipher.decrypt_in_place_detached(
+        aead::Nonce::<ChaCha20Poly1305>::from_slice(&nonce),
+        aad,
+        &mut inner_buffer,
+        aead::Tag::<ChaCha20Poly1305>::from_slice(tag),
+    )?;
+
+    buffer.copy_from_slice(&inner_buffer);
+
     Ok(())
 }
 
@@ -622,10 +660,13 @@ impl Handshake {
         // msg.encrypted_cookie = XAEAD(HASH(LABEL_COOKIE || responder.static_public), msg.nonce, cookie, last_received_msg.mac1)
         let key = b2s_hash(LABEL_COOKIE, &self.params.peer_static_public); // TODO: pre-compute
 
-        let aad = &mac1[0..16];
-        let msg = packet.encrypted_cookie;
-        let mut plaintext = vec![0u8; msg.len()];
-        XChaCha20Poly1305::decrypt(&key, packet.nonce, aad, msg, &mut plaintext)
+        let payload = Payload {
+            aad: &mac1[0..16],
+            msg: packet.encrypted_cookie,
+        };
+        let plaintext = XChaCha20Poly1305::new_from_slice(&key)
+            .unwrap()
+            .decrypt(packet.nonce.into(), payload)
             .map_err(|_| WireGuardError::InvalidAeadTag)?;
 
         let cookie = plaintext

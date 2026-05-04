@@ -10,10 +10,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 
+use aead::generic_array::GenericArray;
+use aead::{AeadInPlace, KeyInit};
 use parking_lot::Mutex;
 use rand_core::{OsRng, RngCore};
 use ring::constant_time::verify_slices_are_equal;
-use wolfssl_wolfcrypt::chacha20_poly1305::XChaCha20Poly1305;
+use wolfssl_wolfcrypt::chacha20_poly1305::XChaCha20Poly1305Aead as XChaCha20Poly1305;
+
+type Key = aead::Key<XChaCha20Poly1305>;
 
 const COOKIE_REFRESH: u64 = 128; // Use 128 and not 120 so the compiler can optimize out the division
 const COOKIE_SIZE: usize = 16;
@@ -41,7 +45,7 @@ pub struct RateLimiter {
     /// A single 64 bit counter (should suffice for many years)
     nonce_ctr: AtomicU64,
     mac1_key: [u8; 32],
-    cookie_key: [u8; 32],
+    cookie_key: Key,
     limit: u64,
     /// The counter since last reset
     count: AtomicU64,
@@ -59,7 +63,7 @@ impl RateLimiter {
             start_time: Instant::now(),
             nonce_ctr: AtomicU64::new(0),
             mac1_key: b2s_hash(LABEL_MAC1, public_key),
-            cookie_key: b2s_hash(LABEL_COOKIE, public_key),
+            cookie_key: b2s_hash(LABEL_COOKIE, public_key).into(),
             limit,
             count: AtomicU64::new(0),
             last_reset: Mutex::new(Instant::now()),
@@ -123,7 +127,8 @@ impl RateLimiter {
 
         let (message_type, rest) = dst.split_at_mut(4);
         let (receiver_index, rest) = rest.split_at_mut(4);
-        let (nonce, encrypted_cookie) = rest.split_at_mut(24);
+        let (nonce, rest) = rest.split_at_mut(24);
+        let (encrypted_cookie, _) = rest.split_at_mut(16 + 16);
 
         // msg.message_type = 3
         // msg.reserved_zero = { 0, 0, 0 }
@@ -132,8 +137,16 @@ impl RateLimiter {
         receiver_index.copy_from_slice(&idx.to_le_bytes());
         nonce.copy_from_slice(&self.nonce()[..]);
 
-        XChaCha20Poly1305::encrypt(&self.cookie_key, nonce, mac1, &cookie, encrypted_cookie)
+        let cipher = XChaCha20Poly1305::new(&self.cookie_key);
+
+        let iv = GenericArray::from_slice(nonce);
+
+        encrypted_cookie[..16].copy_from_slice(&cookie);
+        let tag = cipher
+            .encrypt_in_place_detached(iv, mac1, &mut encrypted_cookie[..16])
             .map_err(|_| WireGuardError::DestinationBufferTooSmall)?;
+
+        encrypted_cookie[16..].copy_from_slice(&tag);
 
         Ok(&mut dst[..super::COOKIE_REPLY_SZ])
     }

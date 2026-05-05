@@ -7,10 +7,12 @@ use crate::noise::session::Session;
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 use crate::x25519;
-use aead::{Aead, AeadInPlace, KeyInit, Payload};
+use aead::{Aead, AeadInPlace, Payload};
+use digest::{Digest, FixedOutput, KeyInit};
 use std::convert::TryInto;
 use std::time::{Duration, SystemTime};
-use wolfssl_wolfcrypt::blake2::{BLAKE2s, BLAKE2sHmac};
+use wolfssl_wolfcrypt::blake2_digest::Blake2s256;
+use wolfssl_wolfcrypt::blake2_mac::{Blake2sMac128, Blake2sMac192};
 use wolfssl_wolfcrypt::chacha20_poly1305::ChaCha20Poly1305Aead as ChaCha20Poly1305;
 use wolfssl_wolfcrypt::chacha20_poly1305::XChaCha20Poly1305Aead as XChaCha20Poly1305;
 use wolfssl_wolfcrypt::curve25519::Curve25519Key;
@@ -37,58 +39,52 @@ const INITIAL_CHAIN_HASH: [u8; KEY_LEN] = [
 
 #[inline]
 pub(crate) fn b2s_hash(data1: &[u8], data2: &[u8]) -> [u8; 32] {
-    let mut hash = BLAKE2s::new(32).unwrap();
-    hash.update(data1).unwrap();
-    hash.update(data2).unwrap();
-    let mut output = [0u8; 32];
-    hash.finalize(&mut output).unwrap();
-    output
+    let mut hash = Blake2s256::new();
+    hash.update(data1);
+    hash.update(data2);
+    hash.finalize().into()
 }
 
 #[inline]
 /// RFC 2401 HMAC+Blake2s, not to be confused with *keyed* Blake2s
 pub(crate) fn b2s_hmac(key: &[u8], data1: &[u8]) -> [u8; 32] {
-    let mut mac = [0u8; 32];
-    BLAKE2sHmac::hmac(data1, key, &mut mac).unwrap();
-    mac
+    use digest::Update;
+    type HmacBlake2s = hmac::SimpleHmac<Blake2s256>;
+    let mut hmac = HmacBlake2s::new_from_slice(key).unwrap();
+    hmac.update(data1);
+    hmac.finalize_fixed().into()
 }
 
 #[inline]
 /// Like b2s_hmac, but chain data1 and data2 together
 pub(crate) fn b2s_hmac2(key: &[u8], data1: &[u8], data2: &[u8]) -> [u8; 32] {
-    let mut mac = [0u8; 32];
-    let mut blake2s_hmac = BLAKE2sHmac::new(key).unwrap();
-    blake2s_hmac.update(data1).unwrap();
-    blake2s_hmac.update(data2).unwrap();
-    blake2s_hmac.finalize(key, &mut mac).unwrap();
-    mac
+    use digest::Update;
+    type HmacBlake2s = hmac::SimpleHmac<Blake2s256>;
+    let mut hmac = HmacBlake2s::new_from_slice(key).unwrap();
+    hmac.update(data1);
+    hmac.update(data2);
+    hmac.finalize_fixed().into()
 }
 
 #[inline]
 pub(crate) fn b2s_keyed_mac_16(key: &[u8], data1: &[u8]) -> [u8; 16] {
-    let mut blake2s = BLAKE2s::new_with_key(16, key).unwrap();
-    blake2s.update(data1).unwrap();
-    let mut hash = [0u8; 16];
-    blake2s.finalize(&mut hash).unwrap();
-    hash
+    let mut hmac = Blake2sMac128::new_from_slice(key).unwrap();
+    digest::Update::update(&mut hmac, data1);
+    hmac.finalize_fixed().into()
 }
 
 #[inline]
 pub(crate) fn b2s_keyed_mac_16_2(key: &[u8], data1: &[u8], data2: &[u8]) -> [u8; 16] {
-    let mut blake2s = BLAKE2s::new_with_key(16, key).unwrap();
-    blake2s.update(data1).unwrap();
-    blake2s.update(data2).unwrap();
-    let mut hash = [0u8; 16];
-    blake2s.finalize(&mut hash).unwrap();
-    hash
+    let mut hmac = Blake2sMac128::new_from_slice(key).unwrap();
+    digest::Update::update(&mut hmac, data1);
+    digest::Update::update(&mut hmac, data2);
+    hmac.finalize_fixed().into()
 }
 
 pub(crate) fn b2s_mac_24(key: &[u8], data1: &[u8]) -> [u8; 24] {
-    let mut blake2s = BLAKE2s::new_with_key(24, key).unwrap();
-    blake2s.update(data1).unwrap();
-    let mut hash = [0u8; 24];
-    blake2s.finalize(&mut hash).unwrap();
-    hash
+    let mut hmac = Blake2sMac192::new_from_slice(key).unwrap();
+    digest::Update::update(&mut hmac, data1);
+    hmac.finalize_fixed().into()
 }
 
 #[inline]
@@ -108,6 +104,7 @@ fn aead_chacha20_seal_inner(
     data: &[u8],
     aad: &[u8],
 ) {
+    use aead::KeyInit;
     let cipher = ChaCha20Poly1305::new_from_slice(key).unwrap();
 
     ciphertext[..data.len()].copy_from_slice(data);
@@ -148,6 +145,7 @@ fn aead_chacha20_open_inner(
     data: &[u8],
     aad: &[u8],
 ) -> Result<(), aead::Error> {
+    use aead::KeyInit;
     let cipher = ChaCha20Poly1305::new_from_slice(key).unwrap();
 
     let (ciphertext, tag) = data.split_at(data.len() - 16);
@@ -664,6 +662,7 @@ impl Handshake {
             aad: &mac1[0..16],
             msg: packet.encrypted_cookie,
         };
+        use aead::KeyInit;
         let plaintext = XChaCha20Poly1305::new_from_slice(&key)
             .unwrap()
             .decrypt(packet.nonce.into(), payload)

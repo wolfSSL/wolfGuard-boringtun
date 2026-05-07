@@ -7,11 +7,12 @@ use crate::noise::session::Session;
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 use crate::x25519;
+use digest::{Digest, FixedOutput, KeyInit};
 use std::convert::TryInto;
 use std::time::{Duration, SystemTime};
 use wolfssl_wolfcrypt::aes::GCM;
 use wolfssl_wolfcrypt::ecc::ECC;
-use wolfssl_wolfcrypt::hmac::HMAC;
+use wolfssl_wolfcrypt::hmac_mac::HmacSha256;
 use wolfssl_wolfcrypt::random::RNG;
 use wolfssl_wolfcrypt::sha::SHA256;
 
@@ -46,62 +47,51 @@ const INITIAL_CHAIN_HASH: [u8; HASH_LEN] = [
 
 #[inline]
 pub(crate) fn sha256_hash(data1: &[u8], data2: &[u8]) -> [u8; 32] {
-    let mut hash = SHA256::new().unwrap();
-    hash.update(data1).unwrap();
-    hash.update(data2).unwrap();
-    let mut output = [0u8; 32];
-    hash.finalize(&mut output).unwrap();
-    output
+    let mut hash = SHA256::default();
+    Digest::update(&mut hash, data1);
+    Digest::update(&mut hash, data2);
+    hash.finalize().into()
 }
 
 #[inline]
 /// HMAC-SHA256
 fn sha256_hmac(key: &[u8], data1: &[u8]) -> [u8; 32] {
-    let mut mac = [0u8; 32];
-    let mut hmac = HMAC::new(HMAC::TYPE_SHA256, key).unwrap();
-    hmac.update(data1).unwrap();
-    hmac.finalize(&mut mac).unwrap();
-    mac
+    let mut hmac = HmacSha256::new_from_slice(key).unwrap();
+    digest::Update::update(&mut hmac, data1);
+    hmac.finalize_fixed().into()
 }
 
 #[inline]
 /// Like sha256_hmac, but chain data1 and data2 together
 fn sha256_hmac2(key: &[u8], data1: &[u8], data2: &[u8]) -> [u8; 32] {
-    let mut mac = [0u8; 32];
-    let mut hmac = HMAC::new(HMAC::TYPE_SHA256, key).unwrap();
-    hmac.update(data1).unwrap();
-    hmac.update(data2).unwrap();
-    hmac.finalize(&mut mac).unwrap();
-    mac
+    let mut hmac = HmacSha256::new_from_slice(key).unwrap();
+    digest::Update::update(&mut hmac, data1);
+    digest::Update::update(&mut hmac, data2);
+    hmac.finalize_fixed().into()
 }
 
 #[inline]
 /// 32-byte MAC using HMAC-SHA256
 pub(crate) fn hmac_sha256_mac_32(key: &[u8], data1: &[u8]) -> [u8; 32] {
-    let mut mac = [0u8; 32];
-    let mut hmac = HMAC::new(HMAC::TYPE_SHA256, key).unwrap();
-    hmac.update(data1).unwrap();
-    hmac.finalize(&mut mac).unwrap();
-    mac
+    let mut hmac = HmacSha256::new_from_slice(key).unwrap();
+    digest::Update::update(&mut hmac, data1);
+    hmac.finalize_fixed().into()
 }
 
 #[inline]
 /// 32-byte MAC using HMAC-SHA256 with two data inputs chained
 pub(crate) fn hmac_sha256_mac_32_2(key: &[u8], data1: &[u8], data2: &[u8]) -> [u8; 32] {
-    let mut mac = [0u8; 32];
-    let mut hmac = HMAC::new(HMAC::TYPE_SHA256, key).unwrap();
-    hmac.update(data1).unwrap();
-    hmac.update(data2).unwrap();
-    hmac.finalize(&mut mac).unwrap();
-    mac
+    let mut hmac = HmacSha256::new_from_slice(key).unwrap();
+    digest::Update::update(&mut hmac, data1);
+    digest::Update::update(&mut hmac, data2);
+    hmac.finalize_fixed().into()
 }
 
 /// 16-byte MAC using HMAC-SHA256 (truncated)
 pub(crate) fn hmac_sha256_mac_16(key: &[u8], data1: &[u8]) -> [u8; 16] {
-    let mut full_mac = [0u8; 32];
-    let mut hmac = HMAC::new(HMAC::TYPE_SHA256, key).unwrap();
-    hmac.update(data1).unwrap();
-    hmac.finalize(&mut full_mac).unwrap();
+    let mut hmac = HmacSha256::new_from_slice(key).unwrap();
+    digest::Update::update(&mut hmac, data1);
+    let full_mac: [u8; 32] = hmac.finalize_fixed().into();
     let mut hash = [0u8; 16];
     hash.copy_from_slice(&full_mac[..16]);
     hash
@@ -862,7 +852,10 @@ impl Handshake {
 mod tests {
     use super::*;
 
+    // FIXME: stale test from the upstream boringtun ChaCha20-Poly1305 path; the
+    // expected vectors are RFC 7539 ChaCha20 outputs and do not apply to AES-GCM.
     #[test]
+    #[ignore]
     fn chacha20_seal_rfc7530_test_vector() {
         let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
         let aad: [u8; 12] = [
@@ -873,8 +866,8 @@ mod tests {
             0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b,
             0x9c, 0x9d, 0x9e, 0x9f,
         ];
-        let nonce: [u8; 12] = [
-            0x07, 0x00, 0x00, 0x00, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+        let nonce: [u8; 16] = [
+            0x07, 0x00, 0x00, 0x00, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0, 0, 0, 0,
         ];
         let mut buffer = vec![0; plaintext.len() + 16];
 
@@ -919,10 +912,10 @@ mod tests {
 
 fn diffie_hellman(private: &[u8], public: &[u8]) -> [u8; 32] {
     let mut shared_secret = [0u8; 32];
-    let mut rng = RNG::new().unwrap();
+    let rng = RNG::new().unwrap();
     let mut ecc_private = ECC::import_private_key_ex(private, &[], ECC::SECP256R1, None, None).unwrap();
     let mut ecc_public = ECC::import_x963_ex(public, ECC::SECP256R1, None, None).unwrap();
-    ecc_private.set_rng(&mut rng).unwrap();
+    ecc_private.set_rng(rng).unwrap();
     let size = ecc_private.shared_secret(&mut ecc_public, &mut shared_secret).unwrap();
     assert_eq!(size, shared_secret.len());
     shared_secret
